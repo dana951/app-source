@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>podinfo</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 2rem 1.25rem;
+      font-family:
+        system-ui,
+        -apple-system,
+        "Segoe UI",
+        Roboto,
+        Helvetica,
+        Arial,
+        sans-serif;
+      color: #0f172a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 28rem;
+      padding: 0;
+      overflow: hidden;
+      background: rgba(252, 252, 253, 0.97);
+      border-radius: 6px;
+      border: 1px solid rgba(15, 23, 42, 0.08);
+      border-top: 3px solid rgba(15, 23, 42, 0.35);
+      box-shadow:
+        0 1px 2px rgba(15, 23, 42, 0.04),
+        0 8px 24px rgba(15, 23, 42, 0.06);
+    }
+
+    .card-inner {
+      padding: 1.35rem 1.35rem 1.1rem;
+    }
+
+    .card-head {
+      margin-bottom: 1.1rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid rgba(15, 23, 42, 0.1);
+    }
+
+    .app-title {
+      margin: 0;
+      font-family:
+        ui-monospace,
+        "SF Mono",
+        Menlo,
+        Monaco,
+        Consolas,
+        "Liberation Mono",
+        monospace;
+      font-size: 1.2rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      color: #0f172a;
+    }
+
+    .subtitle {
+      margin: 0.4rem 0 0 0;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      color: #64748b;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .field-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .field {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.5rem 1.25rem;
+      padding: 0.55rem 0;
+      border-bottom: 1px solid rgba(15, 23, 42, 0.07);
+      font-size: 0.8125rem;
+      line-height: 1.45;
+    }
+
+    .field:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+
+    .field-label {
+      flex: 0 0 auto;
+      min-width: 6.5rem;
+      color: #64748b;
+      font-weight: 500;
+    }
+
+    .field-value {
+      flex: 1 1 8rem;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: #0f172a;
+      word-break: break-all;
+    }
+
+    .card-foot {
+      margin: 0;
+      padding: 0.75rem 1.35rem;
+      font-size: 0.6875rem;
+      color: #94a3b8;
+      letter-spacing: 0.03em;
+      background: rgba(15, 23, 42, 0.03);
+      border-top: 1px solid rgba(15, 23, 42, 0.06);
+    }
+  </style>
+</head>
+<body
+  style="--page-bg: {{ theme_color | safe_css_bg }}; background: var(--page-bg);"
+>
+  <article class="card">
+    <div class="card-inner">
+      <header class="card-head">
+        <h1 class="app-title">podinfo</h1>
+        <p class="subtitle">Pod Runtime Information</p>
+      </header>
+      <ul class="field-list">
+        <li class="field">
+          <span class="field-label">Hostname</span>
+          <span class="field-value">{{ hostname }}</span>
+        </li>
+        <li class="field">
+          <span class="field-label">Environment</span>
+          <span class="field-value">{{ environment }}</span>
+        </li>
+        <li class="field">
+          <span class="field-label">Version</span>
+          <span class="field-value">{{ version }}</span>
+        </li>
+        <li class="field">
+          <span class="field-label">Git SHA</span>
+          <span class="field-value">{{ git_sha }}</span>
+        </li>
+        <li class="field">
+          <span class="field-label">Theme color</span>
+          <span class="field-value">{{ theme_color }}</span>
+        </li>
+      </ul>
+    </div>
+    <footer class="card-foot">podinfo · GitOps Demo Project</footer>
+  </article>
+</body>
+</html>
