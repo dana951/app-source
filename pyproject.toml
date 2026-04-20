@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "jinja2>=3.1.6",
+    "matplotlib>=3.10.7",
     "uvicorn>=0.44.0",
 ]
 
@@ -20,6 +21,7 @@ dev = [
     "black>=26.3.1",
     "httpx>=0.28.1",
     "pytest>=9.0.3",
+    "pytest-mock>=3.15.1",
     "ruff>=0.15.11",
 ]
 
@@ -33,6 +35,15 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 88
 target-version = ["py311"]
+
+[tool.pytest.ini_options]
+addopts = "-rA -s -v"
+markers = [
+    "fast: quick unit tests",
+    "slow: take a long time to run",
+    "api: hit the API",
+    "smoke: quick to run and check basic, critical functionality"
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

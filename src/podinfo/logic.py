@@ -2,31 +2,25 @@ from __future__ import annotations
 
 import os
 import platform
-import re
 import socket
 from datetime import datetime, timezone
 from typing import Any
 
+from matplotlib.colors import is_color_like
+
 
 def _css_background_ok(value: str) -> bool:
-    s = (value or "").strip()
-    if re.fullmatch(r"#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})", s):
-        return True
-    if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9\-]{0,99}", s):
-        return True
-    if re.fullmatch(
-        r"rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(?:,\s*[\d.]+\s*)?\)",
-        s,
-    ):
-        return True
-    return False
+    color_value = (value or "").strip()
+    if not color_value:
+        return False
+    return is_color_like(color_value)
 
 
 def safe_css_background(value: str) -> str:
     """Restrict background color to a safe subset for inline CSS (injection-safe)."""
-    s = (value or "").strip()
-    if _css_background_ok(s):
-        return s
+    color_value = (value or "").strip()
+    if _css_background_ok(color_value):
+        return color_value
     fallback = os.getenv("THEME_COLOR", "blue")
     if _css_background_ok(fallback):
         return fallback
