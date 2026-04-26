@@ -1,0 +1,276 @@
+# .github/actions/trigger-jenkins/action.yml
+#
+# COMPOSITE ACTION: Trigger Jenkins and Wait for Result
+#
+# JENKINS API FLOW (3 steps):
+#   Step 1 — Trigger:
+#     POST /job/{name}/buildWithParameters
+#     Jenkins queues the build and returns HTTP 201 with a
+#     Location header pointing to the queue item:
+#       Location: http://jenkins/queue/item/42/
+#
+#   Step 2 — Resolve queue item → build number:
+#     GET /queue/item/42/api/json
+#     While the build is waiting in the queue, executable is null.
+#     Once Jenkins picks it up, executable.url contains the build URL:
+#       executable.url: http://jenkins/job/podinfo-deploy/15/
+#
+#   Step 3 — Poll build status:
+#     GET /job/podinfo-deploy/15/api/json
+#     The result field is null while running, then one of:
+#       SUCCESS | FAILURE | ABORTED | UNSTABLE
+#     We exit 0 for SUCCESS, exit 1 for anything else.
+
+name: "Trigger Jenkins and Wait"
+description: >
+  Triggers a parameterised Jenkins job via the Jenkins Remote Access API,
+  then polls until the build completes. Fails this action (and therefore
+  the calling workflow job) if Jenkins reports a non-SUCCESS result.
+
+inputs:
+  jenkins-url:
+    description: "Base URL of the Jenkins instance (e.g. http://jenkins.jenkins.svc.cluster.local:8080)"
+    required: true
+  jenkins-user:
+    description: "Jenkins username for API authentication"
+    required: true
+  jenkins-token:
+    description: "Jenkins API token (not the user password)"
+    required: true
+  job-name:
+    description: "Name of the Jenkins job to trigger (e.g. podinfo-deploy)"
+    required: true
+  job-parameters:
+    description: >
+      Newline-separated KEY=VALUE pairs passed as build parameters.
+      Example:
+        IMAGE_TAG=abc1234
+        GIT_SHA=abc1234ef...
+    required: false
+    default: ""
+  timeout-seconds:
+    description: "Total seconds to wait for Jenkins to complete before failing (default: 600)"
+    required: false
+    default: "600"
+  poll-interval-seconds:
+    description: "Seconds between each status poll (default: 15)"
+    required: false
+    default: "15"
+
+outputs:
+  build-url:
+    description: "Full URL of the triggered Jenkins build"
+    value: ${{ steps.poll.outputs.build_url }}
+  build-result:
+    description: "Final Jenkins build result (SUCCESS / FAILURE / ABORTED)"
+    value: ${{ steps.poll.outputs.build_result }}
+
+runs:
+  using: "composite"
+  steps:
+
+    # ── Step 1: Trigger the Jenkins build ────────────────────────────────────
+    - name: Trigger Jenkins build
+      id: trigger
+      shell: bash
+      env:
+        JENKINS_URL:   ${{ inputs.jenkins-url }}
+        JENKINS_USER:  ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN: ${{ inputs.jenkins-token }}
+        JOB_NAME:      ${{ inputs.job-name }}
+        JOB_PARAMS:    ${{ inputs.job-parameters }}
+      run: |
+        echo "──────────────────────────────────────────"
+        echo "Triggering Jenkins job: ${JOB_NAME}"
+        echo "Jenkins URL: ${JENKINS_URL}"
+        echo "──────────────────────────────────────────"
+
+        # Build the curl --data-urlencode arguments from the KEY=VALUE input.
+        # Each line in job-parameters becomes a separate --data-urlencode flag.
+        PARAM_ARGS=""
+        while IFS= read -r line; do
+          # Skip blank lines
+          [ -z "$line" ] && continue
+          PARAM_ARGS="${PARAM_ARGS} --data-urlencode \"${line}\""
+        done <<< "${JOB_PARAMS}"
+
+        # POST to the Jenkins buildWithParameters endpoint.
+        # -i : include response headers (we need the Location header)
+        # -s : silent (no progress bar)
+        # -o : write response body to file (we don't need it but curl requires -o with -w)
+        # -w : write only the HTTP status code to stdout
+        HTTP_RESPONSE=$(eval curl -si \
+          --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+          --request POST \
+          ${PARAM_ARGS} \
+          "${JENKINS_URL}/job/${JOB_NAME}/buildWithParameters" \
+          2>&1)
+
+        HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep "^HTTP" | tail -1 | awk '{print $2}')
+        echo "Jenkins API response status: ${HTTP_STATUS}"
+
+        # Jenkins returns 201 Created when the build is successfully queued.
+        # Any other status means something is wrong (auth failure, job not found, etc.)
+        if [ "${HTTP_STATUS}" != "201" ]; then
+          echo "ERROR: Jenkins trigger failed with HTTP ${HTTP_STATUS}"
+          echo "Full response:"
+          echo "$HTTP_RESPONSE"
+          exit 1
+        fi
+
+        # Extract the queue item URL from the Location response header.
+        # This URL is how we track the build from queue → running.
+        QUEUE_URL=$(echo "$HTTP_RESPONSE" \
+          | grep -i "^location:" \
+          | tr -d '\r' \
+          | awk '{print $2}')
+
+        if [ -z "$QUEUE_URL" ]; then
+          echo "ERROR: Could not extract queue URL from Jenkins response headers"
+          echo "Full response:"
+          echo "$HTTP_RESPONSE"
+          exit 1
+        fi
+
+        echo "Build queued at: ${QUEUE_URL}"
+        echo "queue_url=${QUEUE_URL}" >> $GITHUB_OUTPUT
+
+    # ── Step 2: Wait for Jenkins to assign a build number ────────────────────
+    - name: Resolve queue item to build URL
+      id: resolve
+      shell: bash
+      env:
+        JENKINS_USER:  ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN: ${{ inputs.jenkins-token }}
+        QUEUE_URL:     ${{ steps.trigger.outputs.queue_url }}
+      run: |
+        echo "──────────────────────────────────────────"
+        echo "Waiting for Jenkins to start the build..."
+        echo "Queue item: ${QUEUE_URL}"
+        echo "──────────────────────────────────────────"
+
+        # Jenkins keeps the build in the queue until an executor is free.
+        # We poll the queue item API until executable.url is populated —
+        # that tells us the build has started and has a number assigned.
+        BUILD_URL=""
+        MAX_QUEUE_WAIT=60   # max 60 attempts × 5s = 5 minutes in queue
+        ATTEMPT=0
+
+        while [ $ATTEMPT -lt $MAX_QUEUE_WAIT ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+
+          QUEUE_RESPONSE=$(curl -s \
+            --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+            "${QUEUE_URL}api/json")
+
+          BUILD_URL=$(echo "$QUEUE_RESPONSE" \
+            | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        executable = data.get('executable') or {}
+        print(executable.get('url', ''))
+        " 2>/dev/null)
+
+          if [ -n "$BUILD_URL" ]; then
+            echo "Build started: ${BUILD_URL}"
+            break
+          fi
+
+          # Check if the item was cancelled while in the queue
+          CANCELLED=$(echo "$QUEUE_RESPONSE" \
+            | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        print(data.get('cancelled', False))
+        " 2>/dev/null)
+
+          if [ "$CANCELLED" = "True" ]; then
+            echo "ERROR: Jenkins build was cancelled while in the queue"
+            exit 1
+          fi
+
+          echo "Attempt ${ATTEMPT}/${MAX_QUEUE_WAIT} — build not started yet, waiting 5s..."
+          sleep 5
+        done
+
+        if [ -z "$BUILD_URL" ]; then
+          echo "ERROR: Build never left the queue after $((MAX_QUEUE_WAIT * 5))s"
+          echo "Check Jenkins executor availability and job configuration"
+          exit 1
+        fi
+
+        echo "build_url=${BUILD_URL}" >> $GITHUB_OUTPUT
+
+    # ── Step 3: Poll until the build completes ────────────────────────────────
+    - name: Poll Jenkins build until complete
+      id: poll
+      shell: bash
+      env:
+        JENKINS_USER:          ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN:         ${{ inputs.jenkins-token }}
+        BUILD_URL:             ${{ steps.resolve.outputs.build_url }}
+        TIMEOUT_SECONDS:       ${{ inputs.timeout-seconds }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+      run: |
+        echo "──────────────────────────────────────────"
+        echo "Polling Jenkins build: ${BUILD_URL}"
+        echo "Timeout: ${TIMEOUT_SECONDS}s | Poll interval: ${POLL_INTERVAL_SECONDS}s"
+        echo "──────────────────────────────────────────"
+
+        echo "build_url=${BUILD_URL}" >> $GITHUB_OUTPUT
+
+        ELAPSED=0
+
+        while [ $ELAPSED -lt $TIMEOUT_SECONDS ]; do
+          sleep $POLL_INTERVAL_SECONDS
+          ELAPSED=$((ELAPSED + POLL_INTERVAL_SECONDS))
+
+          BUILD_RESPONSE=$(curl -s \
+            --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+            "${BUILD_URL}api/json")
+
+          # result is null (JSON null) while the build is running.
+          # python3 converts JSON null to the empty string here.
+          RESULT=$(echo "$BUILD_RESPONSE" \
+            | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        print(data.get('result') or '')
+        " 2>/dev/null)
+
+          DURATION=$(echo "$BUILD_RESPONSE" \
+            | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        ms = data.get('duration', 0)
+        print(f'{ms // 1000}s' if ms else 'running')
+        " 2>/dev/null)
+
+          echo "[${ELAPSED}s elapsed] Jenkins result: '${RESULT:-running}' | Duration: ${DURATION}"
+
+          # Empty result means still running — keep polling
+          [ -z "$RESULT" ] && continue
+
+          # Build is complete — record the result and exit accordingly
+          echo "build_result=${RESULT}" >> $GITHUB_OUTPUT
+          echo "──────────────────────────────────────────"
+          echo "Jenkins build complete: ${RESULT}"
+          echo "Build URL: ${BUILD_URL}"
+          echo "──────────────────────────────────────────"
+
+          if [ "$RESULT" = "SUCCESS" ]; then
+            echo "✅ Jenkins pipeline succeeded"
+            exit 0
+          else
+            echo "❌ Jenkins pipeline failed with result: ${RESULT}"
+            echo "View the full build log at: ${BUILD_URL}console"
+            exit 1
+          fi
+        done
+
+        # If we exit the loop, we timed out
+        echo "──────────────────────────────────────────"
+        echo "ERROR: Timed out after ${TIMEOUT_SECONDS}s waiting for Jenkins"
+        echo "The Jenkins build may still be running at: ${BUILD_URL}"
+        echo "──────────────────────────────────────────"
+        exit 1

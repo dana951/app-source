@@ -15,26 +15,34 @@ dependencies = [
     "uvicorn>=0.44.0",
 ]
 
-
 [dependency-groups]
 dev = [
-    "black>=26.3.1",
-    "httpx>=0.28.1",
     "pytest>=9.0.3",
     "pytest-mock>=3.15.1",
     "ruff>=0.15.11",
+    "black>=26.3.1",
+    "mypy>=1.20.2",
+    "bandit>=1.9.4"
+    "types-requests>=2.33.0.20260408"
 ]
 
 [project.scripts]
 podinfo = "podinfo.main:main"
 
-[tool.black]
-line-length = 88
-target-version = ["py311"]
-
 [tool.ruff]
-line-length = 88
-target-version = ["py311"]
+line-length = 65
+
+[tool.black]
+line-length = 65
+
+[tool.mypy]
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = [".venv", "__pycache__", "build", "dist"]
+skips = ["B101"]
 
 [tool.pytest.ini_options]
 addopts = "-rA -s -v"
