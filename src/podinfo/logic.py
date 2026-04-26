@@ -26,6 +26,7 @@ def safe_css_background(value: str) -> str:
         return fallback
     return "blue"
 
+
 class PodInfo:
 
     def get_version(self) -> dict[str, str]:
@@ -45,7 +46,9 @@ class PodInfo:
     def echo_message(self, message: str) -> dict[str, Any]:
         return {
             "message": message,
-            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "timestamp": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
         }
 
     def get_dashboard_html(self) -> dict[str, str]:
