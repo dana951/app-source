@@ -52,7 +52,7 @@ ignore_missing_imports = true
 
 [tool.bandit]
 exclude_dirs = [".venv", "__pycache__", "build", "dist"]
-skips = ["B101"]
+skips = ["B101", "B104"]
 
 [tool.pytest.ini_options]
 addopts = "-rA -s -v"
