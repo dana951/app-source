@@ -34,6 +34,16 @@ line-length = 65
 
 [tool.black]
 line-length = 65
+target-version = ["py311"]
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | build
+  | dist
+  | uv\.lock
+)/
+'''
 
 [tool.mypy]
 warn_return_any = true

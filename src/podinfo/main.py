@@ -8,17 +8,23 @@ from fastapi.templating import Jinja2Templates
 
 from .logic import PodInfo, safe_css_background
 
-app = FastAPI(title="podinfo", version=os.getenv("APP_VERSION", "unknown"))
+app = FastAPI(
+    title="podinfo", version=os.getenv("APP_VERSION", "unknown")
+)
 pod_info = PodInfo()
 
-templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
+templates = Jinja2Templates(
+    directory=str(Path(__file__).resolve().parent / "templates")
+)
 templates.env.filters["safe_css_bg"] = safe_css_background
 
 
 @app.get("/")
 def root(request: Request):
     ctx = pod_info.get_dashboard_html()
-    return templates.TemplateResponse(request, "dashboard.html", ctx)
+    return templates.TemplateResponse(
+        request, "dashboard.html", ctx
+    )
 
 
 @app.get("/health")
