@@ -137,9 +137,8 @@ def test_echo_message(
 ) -> None:
     mock_now = mocker.Mock()
     mock_now.isoformat.return_value = "2026-01-01T10:11:12+00:00"
-    mocker.patch(
-        "podinfo.logic.datetime.now", return_value=mock_now
-    )
+    mock_datetime = mocker.patch("podinfo.logic.datetime")
+    mock_datetime.now.return_value = mock_now
 
     out = pod.echo_message(message)
     assert out == expected
