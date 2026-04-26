@@ -47,7 +47,8 @@ jobs:
     name: "Lint & Static Analysis"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out repo
+        uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -81,7 +82,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out repo
+        uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -112,7 +114,8 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out repo
+        uses: actions/checkout@v6
 
       - name: Compute image tag
         id: tag
@@ -190,7 +193,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
  
     steps:
-      - uses: actions/checkout@v6
+      - name: Check out repo
+        uses: actions/checkout@v6
  
       - name: Trigger Jenkins and wait for result
         uses: ./.github/actions/trigger-jenkins
