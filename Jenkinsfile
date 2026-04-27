@@ -54,6 +54,8 @@ spec:
         requests:
           cpu: 200m
           memory: 256Mi
+    nodeSelector:
+      workload/node-group: jenkins-agents
 """
         }
     }
