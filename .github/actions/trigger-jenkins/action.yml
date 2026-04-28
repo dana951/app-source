@@ -46,8 +46,7 @@ inputs:
       Example:
         IMAGE_TAG=abc1234
         GIT_SHA=abc1234ef...
-    required: false
-    default: ""
+    required: true
   timeout-seconds:
     description: "Total seconds to wait for Jenkins to complete before failing (default: 600)"
     required: false

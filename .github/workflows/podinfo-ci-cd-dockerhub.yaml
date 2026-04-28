@@ -1,26 +1,20 @@
-# .github/workflows/podinfo-ci-cd-ecr.yml
+# .github/workflows/podinfo-ci-cd-dockerhub.yml
 #
 # GITHUB FLOW STRATEGY:
-#   • feature/* branches  → PR workflow: lint + test only (quality gate before merge)
-#   • main branch         → full pipeline: lint + test + build + push + trigger Jenkins
+#   • feature/* branches  → no push pipeline
+#   • PR to main          → lint + unit test only (quality gate before merge)
+#   • merge/push to main  → full pipeline: lint + unit test + build + push + trigger Jenkins
 #
 # RUNNER STRATEGY:
-#   • Public GHA runners (ubuntu-latest) for: lint, test, build, push to ECR
+#   • Public GHA runners (ubuntu-latest) for: lint, test, build, push to Docker Hub
 #     Reason: these jobs need no private network access, public runners are free & fast
 #   • Self-hosted runner (inside EKS) for: triggering Jenkins
-#     Reason: Jenkins is private — only our in-cluster runner can reach it
+#     Reason: Jenkins is private - only our in-cluster runner can reach it
 #     The self-hosted runner registers outbound to GitHub, so Jenkins never
 #     needs a public IP or open inbound firewall rule.
-#
-# ECR AUTH STRATEGY — OIDC (no static AWS keys):
-#   Instead of storing AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as secrets
-#   (which are long-lived, rotatable, and leakable), we use OIDC.
-#   GitHub acts as an identity provider. AWS trusts GitHub's OIDC tokens.
-#   The workflow exchanges a short-lived GitHub JWT for temporary AWS credentials
-#   that expire when the run ends. Nothing to rotate, nothing to leak.
 
 
-name: podinfo CI/CD - ECR
+name: podinfo CI/CD - Docker Hub
 
 on:
   push:
@@ -29,6 +23,16 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      manual_run_mode:
+        description: "Manual run mode"
+        required: false
+        default: "validate_only"
+        type: choice
+        options:
+          - validate_only
+          - build_and_push
+          - build_push_and_deploy
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,8 +41,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.11"
   UV_VERSION: "0.11.7"
-  AWS_REGION: "us-east-1"           
-  ECR_REPOSITORY: "podinfo"
+  DOCKERHUB_IMAGE: "devuser103/podinfo"
 
 jobs:
 
@@ -56,7 +59,9 @@ jobs:
           version: ${{ env.UV_VERSION }}
 
       - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         run: uv sync --group dev --frozen
@@ -75,7 +80,7 @@ jobs:
 
   # ── Job 2: Tests ───────────────────────────────────────────────────────────
   tests:
-    name: "Tests (Python ${{ matrix.python-version }})"
+    name: "Unit Tests (Python ${{ matrix.python-version }})"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -91,7 +96,9 @@ jobs:
           version: ${{ env.UV_VERSION }}
 
       - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync --group dev --frozen
@@ -99,18 +106,20 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
-  # ── Job 3: Build & Push to ECR ────────────────────────────────────────────
+  # ── Job 3: Build & Push to Docker Hub ─────────────────────────────────────
   build-and-push:
-    name: "Build & Push to ECR"
+    name: "Build & Push to Docker Hub"
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && contains(fromJSON('["build_and_push","build_push_and_deploy"]'), inputs.manual_run_mode))
     needs: [lint, tests]
+    outputs:
+      image_tag: ${{ steps.tag.outputs.short_sha }}
+      image_uri: ${{ env.DOCKERHUB_IMAGE }}:${{ steps.tag.outputs.short_sha }}
+      image_digest: ${{ steps.build.outputs.digest }}
 
-    # REQUIRED for OIDC authentication to AWS.
-    # id-token: write  → allows the workflow to request a JWT from GitHub's OIDC provider
-    # contents: read   → allows checkout
     permissions:
-      id-token: write
       contents: read
 
     steps:
@@ -123,36 +132,24 @@ jobs:
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
           echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
 
-      - name: Configure AWS credentials via OIDC
-        # This action exchanges the GitHub OIDC JWT for temporary AWS credentials.
-        # No static keys anywhere — credentials are valid for this run only.
-        # role-to-assume: the IAM role ARN we created with ECR push permissions.
-        uses: aws-actions/configure-aws-credentials@v6
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: github-actions-podinfo-${{ github.run_id }}
-
-      - name: Log in to Amazon ECR
-        id: login-ecr
-        # This action runs: aws ecr get-login-password
-        # using the temporary credentials obtained in the previous step.
-        uses: aws-actions/amazon-ecr-login@v2
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          # ECR image URI format:
-          # <account_id>.dkr.ecr.<region>.amazonaws.com/<repository>:<tag>
-          # steps.login-ecr.outputs.registry resolves to the account/region-specific URL
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.short_sha }}
-            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ env.DOCKERHUB_IMAGE }}:${{ steps.tag.outputs.short_sha }}
+            ${{ env.DOCKERHUB_IMAGE }}:latest
           build-args: |
             APP_VERSION=${{ github.ref_name }}-${{ steps.tag.outputs.short_sha }}
             GIT_SHA=${{ github.sha }}
@@ -164,13 +161,17 @@ jobs:
       - name: Summary
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## ECR Push
+          ## Docker Hub Push
 
-          | Field      | Value |
+          | Field | Value |
           |---|---|
-          | Image      | ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.tag.outputs.short_sha }} |
-          | SHA        | ${{ github.sha }} |
-          | Run ID     | ${{ github.run_id }} |
+          | Registry | Docker Hub |
+          | Repository | \`${{ env.DOCKERHUB_IMAGE }}\` |
+          | Image (versioned) | \`${{ env.DOCKERHUB_IMAGE }}:${{ steps.tag.outputs.short_sha }}\` |
+          | Image (latest) | \`${{ env.DOCKERHUB_IMAGE }}:latest\` |
+          | Image digest | \`${{ steps.build.outputs.digest }}\` |
+          | Git SHA | \`${{ github.sha }}\` |
+          | Workflow run | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
           EOF
 
   # ── Job 4: Trigger Jenkins Deployment Pipeline ────────────────────────────
@@ -190,7 +191,9 @@ jobs:
     name: "Trigger Jenkins Deployment"
     runs-on: self-hosted
     needs: [build-and-push]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.manual_run_mode == 'build_push_and_deploy')
  
     steps:
       - name: Check out repo
