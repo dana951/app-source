@@ -23,8 +23,8 @@ spec:
       command: ["sh", "-c", "sleep 600"]
       tty: true
 
-  nodeSelector:
-    workload/node-group: jenkins-agents
+  # nodeSelector:
+  #  workload/node-group: jenkins-agents
 """
         }
     }
