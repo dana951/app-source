@@ -1,0 +1,212 @@
+// PR validation pipeline (GitHub Actions → Jenkins)
+// Ephemeral namespace per PR commit via GitOps branch + ApplicationSet; tests; branch delete cascades cleanup.
+//
+// Parameters are passed from .github/workflows/podinfo-pr-validation.yaml (buildWithParameters).
+
+@Library('jenkins-shared-lib') _
+
+pipeline {
+
+    agent {
+        kubernetes {
+            label "podinfo-pr-validation-${env.BUILD_NUMBER}"
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+
+    - name: tools
+      image: alpine/k8s:1.35.4
+      command: [cat]
+      tty: true
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+
+    - name: python
+      image: python:3.11-slim
+      command: [cat]
+      tty: true
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+  nodeSelector:
+    workload/node-group: jenkins-agents
+"""
+        }
+    }
+
+    parameters {
+        string(name: 'IMAGE_TAG', description: 'Docker image tag (e.g. abc1234-dev)')
+        string(name: 'SHORT_SHA', description: '7-char git SHA (no -dev suffix)')
+        string(name: 'PR_NUMBER', description: 'GitHub pull request number')
+        string(name: 'IMAGE_REPOSITORY', description: 'Docker image repository', defaultValue: 'devuser103/podinfo')
+        string(name: 'GITHUB_PR_URL', defaultValue: '', description: 'Link to the GitHub PR')
+        string(name: 'GITHUB_ACTIONS_RUN_URL', defaultValue: '', description: 'GitHub Actions run that triggered this build')
+    }
+
+    environment {
+        GITOPS_REPO            = 'git@github.com:dana951/gitops-manifests.git'
+        GIT_CREDS_ID           = 'github-ssh-key-id'
+        GITOPS_BRANCH          = "podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
+        NAMESPACE              = "podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
+        ARGOCD_APP_NAME        = "podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
+        APP_SVC_URL            = "http://podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}.podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}.svc.cluster.local"
+        GITOPS_BRANCH_CREATED  = 'false'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage('Validate parameters') {
+            steps {
+                script {
+                    if (!params.IMAGE_TAG?.trim()) {
+                        error('IMAGE_TAG is required')
+                    }
+                    if (!params.SHORT_SHA?.trim()) {
+                        error('SHORT_SHA is required')
+                    }
+                    if (!params.PR_NUMBER?.trim()) {
+                        error('PR_NUMBER is required')
+                    }
+                    if (!params.IMAGE_REPOSITORY?.trim()) {
+                        error('IMAGE_REPOSITORY is required')
+                    }
+
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} | PR-${params.PR_NUMBER} | ${params.SHORT_SHA}"
+                    currentBuild.description = """
+                    PR: ${params.GITHUB_PR_URL ?: 'n/a'}
+                    Actions: ${params.GITHUB_ACTIONS_RUN_URL ?: 'n/a'}
+                    Image: ${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}
+                    GitOps branch: ${env.GITOPS_BRANCH}
+                    ArgoCD Application: ${env.ARGOCD_APP_NAME}
+                    Namespace: ${env.NAMESPACE}
+                    """.stripIndent().trim()
+
+                    echo """
+                    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    PR VALIDATION (ephemeral GitOps / ArgoCD)
+                    IMAGE_TAG:              ${params.IMAGE_TAG}
+                    SHORT_SHA:              ${params.SHORT_SHA}
+                    PR_NUMBER:              ${params.PR_NUMBER}
+                    IMAGE_REPOSITORY:       ${params.IMAGE_REPOSITORY}
+                    GITHUB_PR_URL:          ${params.GITHUB_PR_URL}
+                    GITHUB_ACTIONS_RUN_URL: ${params.GITHUB_ACTIONS_RUN_URL}
+                    GITOPS_BRANCH:          ${env.GITOPS_BRANCH}
+                    ARGOCD_APP_NAME:        ${env.ARGOCD_APP_NAME}
+                    APP_SVC_URL:            ${env.APP_SVC_URL}
+                    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    """
+                }
+            }
+        }
+        stage('Push GitOps branch') {
+            steps {
+                container('tools') {
+                    sshagent([credentials: [env.GIT_CREDS_ID]]) { 
+                        script {
+                            dir('gitops-work') {
+                                sh """
+                                    set -eu
+                                    git clone --depth 1 ${env.GITOPS_REPO} .
+
+                                    git config user.email "jenkins@ci.local"
+                                    git config user.name "Jenkins CI"
+                                    
+                                    git checkout -B ${env.GITOPS_BRANCH}
+                                    
+                                    mkdir -p environments/podinfo/qa
+                                    cat > environments/podinfo/qa/values.yaml <<EOF
+env:
+    APP_ENV: "qa"
+image:
+    tag: ${params.IMAGE_TAG}
+EOF
+                                    git add environments/podinfo/qa/values.yaml
+                                    git commit -m "test(pr-validation): ephemeral PR env: \${GITOPS_BRANCH} image ${params.IMAGE_TAG}"
+                                    git push origin ${env.GITOPS_BRANCH} --force
+                                """
+                                env.GITOPS_BRANCH_CREATED = 'true'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Wait for ArgoCD Healthy') {
+            steps {
+                container('tools') {
+                    script {
+                        WaitForArgoAppSync(
+                            appName: env.ARGOCD_APP_NAME,
+                            namespace: 'argocd',
+                            timeoutSeconds: 300,
+                            pollSeconds: 10
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Smoke tests') {
+            steps {
+                container('python') {
+                    script {
+                        runTests(
+                            environment:     'qa',
+                            appUrl:            env.APP_SVC_URL,
+                            expectedVersion:   params.SHORT_SHA,
+                            markers:           'smoke'
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('E2E tests') {
+            steps {
+                container('python') {
+                    script {
+                        runTests(
+                            environment:     'qa',
+                            appUrl:            env.APP_SVC_URL,
+                            expectedVersion:   params.SHORT_SHA,
+                            markers:           'e2e'
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (env.GITOPS_BRANCH_CREATED == 'true') {
+                    container('tools') {
+                        sh """
+                            set +e
+                            rm -rf gitops-cleanup
+                            git clone --depth 1 "\${GITOPS_REPO}" gitops-cleanup
+                            cd gitops-cleanup
+                            git push origin --delete "\${GITOPS_BRANCH}" || true
+                        """
+                    }
+                }
+            }
+            cleanWs()
+        }
+    }
+}

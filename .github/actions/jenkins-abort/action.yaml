@@ -1,0 +1,77 @@
+name: "Abort Jenkins E2E (PR-aware)"
+description: >
+  Finds last Jenkins E2E build from PR comments and aborts it if still running.
+
+inputs:
+  jenkins-url:
+    description: "Base URL of the Jenkins instance (e.g. http://jenkins.jenkins.svc.cluster.local:8080)"
+    required: true
+  jenkins-user:
+    description: "Jenkins username for API authentication"
+    required: true
+  jenkins-token:
+    description: "Jenkins API token"
+    required: true
+  pr-number:
+    description: "Pull request number for issue comments API"
+    required: true
+  repo:
+    description: "owner/repo for GitHub API (e.g. org/app-source)"
+    required: true
+  github-token:
+    description: "GitHub token for PR comments (omit to skip comment create/update)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Abort previous Jenkins build
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        JENKINS_URL: ${{ inputs.jenkins-url }}
+        JENKINS_USER: ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN: ${{ inputs.jenkins-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        REPO: ${{ inputs.repo }}
+
+      run: |
+        set -euo pipefail
+
+        echo "Fetching PR comments..."
+
+        LAST_URL=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+          --jq '.[] | select(.body | contains("podinfo-e2e-jenkins:")) | .body' \
+          | grep -oE 'https?://[^>[:space:]]+' \
+          | tail -n 1 \
+          | sed 's|/$||')
+
+        if [ -z "${LAST_URL}" ]; then
+          echo "No previous Jenkins build found"
+          exit 0
+        fi
+
+        echo "Checking previous Jenkins build: ${LAST_URL}"
+
+        BUILD_JSON=$(curl -sS --user "${JENKINS_USER}:${JENKINS_TOKEN}" "${LAST_URL}/api/json" || true)
+
+        BUILDING=$(echo "${BUILD_JSON}" | jq -r '.building // false')
+
+        if [ "${BUILDING}" != "true" ]; then
+          echo "Previous build is not running; nothing to abort."
+          exit 0
+        fi
+
+        echo "Aborting previous Jenkins build..."
+
+        CRUMB_JSON=$(curl -sS --user "${JENKINS_USER}:${JENKINS_TOKEN}" "${JENKINS_URL}/crumbIssuer/api/json" || true)
+
+        CRUMB=$(echo "${CRUMB_JSON}" | jq -r '.crumb // empty')
+        CRUMB_FIELD=$(echo "${CRUMB_JSON}" | jq -r '.crumbRequestField // "Jenkins-Crumb"')
+
+        curl -sS -X POST \
+          --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+          -H "${CRUMB_FIELD}: ${CRUMB}" \
+          "${LAST_URL}/stop" || true
+
+        echo "Jenkins build stop requested ${LAST_URL}"
