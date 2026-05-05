@@ -1,6 +1,6 @@
 # podinfo
 
-Application source code with a full CI/CD GitHub Actions + Jenkins pipelines driving a GitOps deployment workflow
+Application source code with a CI/CD GitHub Actions + Jenkins pipelines driving a GitOps deployment workflow
 
 This repository is part of the [**eks-gitops-platform**](https://github.com/dana951/eks-gitops-platform) project - GitOps CI/CD workflow on AWS EKS. 
 
