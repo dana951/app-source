@@ -1,0 +1,217 @@
+# WORKFLOW: PR Validation Pipeline (feature/* → main)
+#
+# PURPOSE:
+# This workflow validates pull requests before merging into main.
+# It enforces code quality, correctness, and deployability.
+#
+# HIGH-LEVEL FLOW:
+#   1. Lint & static analysis (code quality gate)
+#   2. Unit tests (multi-version Python matrix)
+#   3. Build & push Docker image (tagged with <short-sha>-dev)
+#   4. Trigger Jenkins E2E pipeline and wait for result
+#
+# DESIGN PRINCIPLES:
+#   - Fail fast on code quality issues
+#   - Build artifact once, reuse everywhere
+#   - Externalize smoke/E2E teststo Jenkins
+#   - Prevent duplicate/stale executions
+#
+# RUNNERS:
+#   • ubuntu-latest → CI steps (lint, test, build)
+#   • self-hosted   → Jenkins orchestration (network access, control)
+
+
+name: podinfo PR validation - Docker Hub
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  UV_VERSION: "0.11.7"
+  DOCKERHUB_IMAGE: "devuser103/podinfo"
+
+jobs:
+
+  # ── Job 1: Lint & Static Analysis ─────────────────────────────────────────
+  lint:
+    name: "Lint & Static Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --group dev --frozen
+
+      - name: Ruff - lint
+        run: uv run ruff check src/ tests/ --output-format=github
+
+      - name: Black - format check
+        run: uv run black --check src/ tests/
+
+      - name: Mypy - type check
+        run: uv run mypy src/
+
+      - name: Bandit - security scan
+        run: uv run bandit -c pyproject.toml -r src/
+
+  # ── Job 2: Unit Tests ─────────────────────────────────────────────────────
+  tests:
+    name: "Unit Tests (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --group dev --frozen
+
+      - name: Run tests
+        run: uv run pytest
+
+  # ── Job 3: Build & Push to Docker Hub (<short-sha>-dev) ───────────────────
+  build-and-push:
+    name: "Build & Push to Docker Hub"
+    runs-on: ubuntu-latest
+    needs: [lint, tests]
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ env.DOCKERHUB_IMAGE }}:${{ steps.meta.outputs.image_tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_tag=${SHORT_SHA}-dev" >> $GITHUB_OUTPUT
+          {
+            echo "docker_tags<<EOF"
+            echo "${DOCKERHUB_IMAGE}:${SHORT_SHA}-dev"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.docker_tags }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.short_sha }}
+            GIT_SHA=${{ github.sha }}
+          labels: |
+            git.sha=${{ github.sha }}
+            git.branch=${{ github.ref_name }}
+            build.run_id=${{ github.run_id }}
+
+      - name: Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Docker Hub Push (PR)
+
+          | Field | Value |
+          |---|---|
+          | Registry | Docker Hub |
+          | Repository | \`${{ env.DOCKERHUB_IMAGE }}\` |
+          | Tags pushed | \`${{ steps.meta.outputs.docker_tags }}\` |
+          | Primary tag | \`${{ steps.meta.outputs.image_tag }}\` |
+          | Image digest | \`${{ steps.build.outputs.digest }}\` |
+          | Git SHA | \`${{ github.sha }}\` |
+          EOF
+
+  # ── Job 4: Jenkins E2E (self-hosted) ──────────────────────────────────────
+  jenkins-e2e:
+    name: "Jenkins E2E (PR validation)"
+    runs-on: eks-gh-runner
+    needs: [build-and-push]
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      
+      - name: Abort previous Jenkins E2E build for this PR (if still running)
+        uses: ./.github/actions/jenkins-abort
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          jenkins-url: ${{ secrets.JENKINS_URL }}
+          jenkins-user: ${{ secrets.JENKINS_USER }}
+          jenkins-token: ${{ secrets.JENKINS_API_TOKEN }}
+          pr-number: ${{ github.event.pull_request.number }}
+          repo: ${{ github.repository }}
+
+      - name: Trigger Jenkins PR validation and wait
+        env:
+          GHA_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        uses: ./.github/actions/jenkins-trigger
+        with:
+          jenkins-url: ${{ secrets.JENKINS_URL }}
+          jenkins-user: ${{ secrets.JENKINS_USER }}
+          jenkins-token: ${{ secrets.JENKINS_API_TOKEN }}
+          job-name: podinfo-pr-validation
+          job-parameters: |
+            IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
+            SHORT_SHA=${{ needs.build-and-push.outputs.short_sha }}
+            PR_NUMBER=${{ github.event.pull_request.number }}
+            IMAGE_REPOSITORY=${{ env.DOCKERHUB_IMAGE }}
+            GITHUB_PR_URL=${{ github.event.pull_request.html_url }}
+            GITHUB_ACTIONS_RUN_URL=${{ env.GHA_RUN_URL }}
+          timeout-seconds: "1200"
+          poll-interval-seconds: "30"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          github-actions-run-url: ${{ env.GHA_RUN_URL }}

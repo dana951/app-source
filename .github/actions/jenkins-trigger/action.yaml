@@ -1,0 +1,355 @@
+# COMPOSITE ACTION: Trigger Jenkins and Wait for Result
+#
+# JENKINS API FLOW (3 steps):
+#   Step 1 — Trigger:
+#     POST /job/{name}/buildWithParameters
+#     Jenkins queues the build and returns HTTP 201 with a
+#     Location header pointing to the queue item:
+#       Location: http://jenkins/queue/item/42/
+#
+#   Step 2 — Resolve queue item → build number:
+#     GET /queue/item/42/api/json
+#     While the build is waiting in the queue, executable is null.
+#     Once Jenkins picks it up, executable.url contains the build URL:
+#       executable.url: http://jenkins/job/podinfo-deploy/15/
+#
+#   Step 3 — Poll build status:
+#     GET /job/podinfo-deploy/15/api/json
+#     The result field is null while running, then one of:
+#       SUCCESS | FAILURE | ABORTED | UNSTABLE
+#     We exit 0 for SUCCESS, exit 1 for anything else.
+
+name: "Trigger Jenkins and Wait"
+description: >
+  Triggers a parameterised Jenkins job via the Jenkins Remote Access API,
+  then polls until the build completes. Fails this action (and therefore
+  the calling workflow job) if Jenkins reports a non-SUCCESS result.
+  Optional GitHub PR comments: post when the build starts, update when it finishes.
+
+inputs:
+  jenkins-url:
+    description: "Base URL of the Jenkins instance (e.g. http://jenkins.jenkins.svc.cluster.local:8080)"
+    required: true
+  jenkins-user:
+    description: "Jenkins username for API authentication"
+    required: true
+  jenkins-token:
+    description: "Jenkins API token"
+    required: true
+  job-name:
+    description: "Name of the Jenkins job to trigger (e.g. podinfo-deploy)"
+    required: true
+  job-parameters:
+    description: >
+      Newline-separated KEY=VALUE pairs passed as build parameters.
+      Example:
+        IMAGE_TAG=abc1234
+        GIT_SHA=abc1234ef...
+    required: true
+  timeout-seconds:
+    description: "Total seconds to wait for Jenkins to complete before failing (default: 600)"
+    required: false
+    default: "600"
+  poll-interval-seconds:
+    description: "Seconds between each status poll (default: 15)"
+    required: false
+    default: "15"
+  github-token:
+    description: "GitHub token for PR comments (omit to skip comment create/update)"
+    required: false
+    default: ""
+  repository:
+    description: "owner/repo for GitHub API (e.g. org/app-source)"
+    required: false
+    default: ""
+  pull-request-number:
+    description: "Pull request number for issue comments API"
+    required: false
+    default: ""
+  github-actions-run-url:
+    description: "URL of the GitHub Actions run that triggered Jenkins (shown in Jenkins / comments)"
+    required: false
+    default: ""
+
+outputs:
+  build-url:
+    description: "Full URL of the triggered Jenkins build"
+    value: ${{ steps.poll.outputs.build_url }}
+  build-result:
+    description: "Final Jenkins build result (SUCCESS / FAILURE / ABORTED / UNSTABLE / TIMEOUT)"
+    value: ${{ steps.poll.outputs.build_result }}
+  build-number:
+    description: "Jenkins build number (if resolved)"
+    value: ${{ steps.poll.outputs.build_number }}
+
+runs:
+  using: "composite"
+  steps:
+
+    # ── Step 1: Trigger the Jenkins build ────────────────────────────────────
+    - name: Trigger Jenkins build
+      id: trigger
+      shell: bash
+      env:
+        JENKINS_URL:   ${{ inputs.jenkins-url }}
+        JENKINS_USER:  ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN: ${{ inputs.jenkins-token }}
+        JOB_NAME:      ${{ inputs.job-name }}
+        JOB_PARAMS:    ${{ inputs.job-parameters }}
+      run: |
+        set -euo pipefail
+        echo "──────────────────────────────────────────"
+        echo "Triggering Jenkins job: ${JOB_NAME}"
+        echo "Jenkins URL: ${JENKINS_URL}"
+        echo "──────────────────────────────────────────"
+
+        CURL_CMD=(curl -si --user "${JENKINS_USER}:${JENKINS_TOKEN}" --request POST)
+        while IFS= read -r line || [ -n "$line" ]; do
+          [ -z "$line" ] && continue
+          CURL_CMD+=(--data-urlencode "$line")
+        done <<< "${JOB_PARAMS}"
+        CURL_CMD+=("${JENKINS_URL}/job/${JOB_NAME}/buildWithParameters")
+
+        HTTP_RESPONSE=$("${CURL_CMD[@]}" 2>&1)
+
+        HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep "^HTTP" | tail -1 | awk '{print $2}')
+        echo "Jenkins API response status: ${HTTP_STATUS}"
+
+        if [ "${HTTP_STATUS}" != "201" ]; then
+          echo "ERROR: Jenkins trigger failed with HTTP ${HTTP_STATUS}"
+          echo "Full response:"
+          echo "$HTTP_RESPONSE"
+          exit 1
+        fi
+
+        QUEUE_URL=$(echo "$HTTP_RESPONSE" \
+          | grep -i "^location:" \
+          | tr -d '\r' \
+          | awk '{print $2}')
+
+        if [ -z "${QUEUE_URL}" ]; then
+          echo "ERROR: Could not extract queue URL from Jenkins response headers"
+          echo "Full response:"
+          echo "$HTTP_RESPONSE"
+          exit 1
+        fi
+
+        echo "Build queued at: ${QUEUE_URL}"
+        echo "queue_url=${QUEUE_URL}" >> "${GITHUB_OUTPUT}"
+
+    # ── Step 2: Wait for Jenkins to assign a build number ────────────────────
+    - name: Resolve queue item to build URL
+      id: resolve
+      shell: bash
+      env:
+        JENKINS_USER:  ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN: ${{ inputs.jenkins-token }}
+        QUEUE_URL:     ${{ steps.trigger.outputs.queue_url }}
+      run: |
+        set -euo pipefail
+        echo "──────────────────────────────────────────"
+        echo "Waiting for Jenkins to start the build..."
+        echo "Queue item: ${QUEUE_URL}"
+        echo "──────────────────────────────────────────"
+
+        BUILD_URL=""
+        MAX_QUEUE_WAIT=60
+        ATTEMPT=0
+
+        while [ "${ATTEMPT}" -lt "${MAX_QUEUE_WAIT}" ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+
+          QUEUE_RESPONSE=$(curl -s \
+            --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+            "${QUEUE_URL}api/json")
+
+          BUILD_URL=$(echo "${QUEUE_RESPONSE}" | jq -r '.executable.url // empty')
+
+          if [ -n "${BUILD_URL}" ]; then
+            echo "Build started: ${BUILD_URL}"
+            break
+          fi
+
+          CANCELLED=$(echo "${QUEUE_RESPONSE}" | jq -r '.cancelled // false')
+          if [ "${CANCELLED}" = "true" ]; then
+            echo "ERROR: Jenkins build was cancelled while in the queue"
+            exit 1
+          fi
+
+          echo "Attempt ${ATTEMPT}/${MAX_QUEUE_WAIT} — build not started yet, waiting 5s..."
+          sleep 5
+        done
+
+        if [ -z "${BUILD_URL}" ]; then
+          echo "ERROR: Build never left the queue after $((MAX_QUEUE_WAIT * 5))s"
+          echo "Check Jenkins executor availability and job configuration"
+          exit 1
+        fi
+
+        echo "build_url=${BUILD_URL}" >> "${GITHUB_OUTPUT}"
+
+    # ── Step 2b: PR comment — tests started ───────────────────────────────────
+    - name: Post PR comment (E2E started)
+      id: pr_comment_start
+      if: >
+        inputs.github-token != '' &&
+        inputs.repository != '' &&
+        inputs.pull-request-number != ''
+      shell: bash
+      env:
+        GH_TOKEN:               ${{ inputs.github-token }}
+        REPOSITORY:             ${{ inputs.repository }}
+        PR_NUMBER:              ${{ inputs.pull-request-number }}
+        BUILD_URL:              ${{ steps.resolve.outputs.build_url }}
+        GITHUB_ACTIONS_RUN_URL: ${{ inputs.github-actions-run-url }}
+      run: |
+        set -euo pipefail
+        BUILD_NUM=$(echo "${BUILD_URL}" | sed 's|/*$||' | awk -F'/' '{print $NF}')
+        JSON_BODY=$(jq -n \
+          --arg b "${BUILD_NUM}" \
+          --arg u "${BUILD_URL}" \
+          --arg r "${GITHUB_ACTIONS_RUN_URL}" \
+          '{body: ("🔄 E2E tests started on Jenkins — Build #\($b) — \($u)\n\nTriggered from: \($r)\n\n<!-- podinfo-e2e-jenkins:\($u) -->")}')
+        RESP=$(curl -sS -w "\n%{http_code}" \
+          -X POST \
+          -H "Authorization: Bearer ${GH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/${REPOSITORY}/issues/${PR_NUMBER}/comments" \
+          -d "${JSON_BODY}")
+        HTTP_CODE=$(echo "${RESP}" | tail -n1)
+        BODY_JSON=$(echo "${RESP}" | sed '$d')
+        if [ "${HTTP_CODE}" != "201" ]; then
+          echo "WARNING: Failed to create PR comment (HTTP ${HTTP_CODE}): ${BODY_JSON}"
+          exit 0
+        fi
+        CID=$(echo "${BODY_JSON}" | jq -r '.id // empty')
+        echo "comment_id=${CID}" >> "${GITHUB_OUTPUT}"
+        echo "Posted PR comment id=${CID}"
+
+    # ── Step 3: Poll until the build completes ────────────────────────────────
+    - name: Poll Jenkins build until complete
+      id: poll
+      shell: bash
+      env:
+        JENKINS_USER:          ${{ inputs.jenkins-user }}
+        JENKINS_TOKEN:         ${{ inputs.jenkins-token }}
+        BUILD_URL:             ${{ steps.resolve.outputs.build_url }}
+        TIMEOUT_SECONDS:       ${{ inputs.timeout-seconds }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+      run: |
+        set -euo pipefail
+        echo "──────────────────────────────────────────"
+        echo "Polling Jenkins build: ${BUILD_URL}"
+        echo "Timeout: ${TIMEOUT_SECONDS}s | Poll interval: ${POLL_INTERVAL_SECONDS}s"
+        echo "──────────────────────────────────────────"
+
+        echo "build_url=${BUILD_URL}" >> "${GITHUB_OUTPUT}"
+        BUILD_NUM=$(echo "${BUILD_URL}" | sed 's|/*$||' | awk -F'/' '{print $NF}')
+        echo "build_number=${BUILD_NUM}" >> "${GITHUB_OUTPUT}"
+
+        ELAPSED=0
+        RESULT=""
+
+        while [ "${ELAPSED}" -lt "${TIMEOUT_SECONDS}" ]; do
+          sleep "${POLL_INTERVAL_SECONDS}"
+          ELAPSED=$((ELAPSED + POLL_INTERVAL_SECONDS))
+
+          BUILD_RESPONSE=$(curl -s \
+            --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+            "${BUILD_URL}api/json")
+
+          RESULT=$(echo "${BUILD_RESPONSE}" | jq -r '.result // empty')
+
+          DURATION=$(echo "${BUILD_RESPONSE}" | jq -r '
+            if (.duration // 0) > 0
+            then ((.duration / 1000) | floor | tostring) + "s"
+            else "running"
+            end
+          ')
+
+          echo "[${ELAPSED}s elapsed] Jenkins result: '${RESULT:-running}' | Duration: ${DURATION}"
+
+          [ -z "${RESULT}" ] && continue
+
+          echo "build_result=${RESULT}" >> "${GITHUB_OUTPUT}"
+          echo "──────────────────────────────────────────"
+          echo "Jenkins build complete: ${RESULT}"
+          echo "Build URL: ${BUILD_URL}"
+          echo "──────────────────────────────────────────"
+          exit 0
+        done
+
+        echo "build_result=TIMEOUT" >> "${GITHUB_OUTPUT}"
+        echo "──────────────────────────────────────────"
+        echo "ERROR: Timed out after ${TIMEOUT_SECONDS}s waiting for Jenkins"
+        echo "The Jenkins build may still be running at: ${BUILD_URL}"
+        echo "──────────────────────────────────────────"
+        exit 1
+
+    # ── Step 4: Update PR comment with final status ───────────────────────────
+    - name: Update PR comment (E2E finished)
+      if: >
+        always() &&
+        inputs.github-token != '' &&
+        inputs.repository != '' &&
+        inputs.pull-request-number != '' &&
+        steps.pr_comment_start.outcome == 'success' &&
+        steps.pr_comment_start.outputs.comment_id != ''
+      shell: bash
+      env:
+        GH_TOKEN:      ${{ inputs.github-token }}
+        REPOSITORY:    ${{ inputs.repository }}
+        COMMENT_ID:    ${{ steps.pr_comment_start.outputs.comment_id }}
+        BUILD_URL:     ${{ steps.resolve.outputs.build_url }}
+        BUILD_RESULT:  ${{ steps.poll.outputs.build_result }}
+      run: |
+        set -euo pipefail
+        RESULT="${BUILD_RESULT:-}"
+        BUILD_NUM=$(echo "${BUILD_URL}" | sed 's|/*$||' | awk -F'/' '{print $NF}')
+        case "${RESULT}" in
+          SUCCESS)
+            LINE="✅ E2E tests PASSED — Build #${BUILD_NUM} — ${BUILD_URL}" ;;
+          FAILURE)
+            LINE="❌ E2E tests FAILED — Build #${BUILD_NUM} — ${BUILD_URL}" ;;
+          ABORTED)
+            LINE="⚠️ E2E tests ABORTED — Build #${BUILD_NUM} — ${BUILD_URL}" ;;
+          UNSTABLE)
+            LINE="⚠️ E2E tests UNSTABLE — Build #${BUILD_NUM} — ${BUILD_URL}" ;;
+          TIMEOUT)
+            LINE="❌ E2E tests FAILED (timed out waiting for Jenkins) — Build #${BUILD_NUM} — ${BUILD_URL}" ;;
+          *)
+            LINE="❌ E2E tests FAILED — Build #${BUILD_NUM} — ${BUILD_URL} (result: ${RESULT:-unknown})" ;;
+        esac
+        JSON_BODY=$(jq -n --arg line "${LINE}" '{body: $line}')
+        HTTP_CODE=$(curl -sS -o /tmp/gh_patch_body -w "%{http_code}" \
+          -X PATCH \
+          -H "Authorization: Bearer ${GH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/${REPOSITORY}/issues/comments/${COMMENT_ID}" \
+          -d "${JSON_BODY}")
+        if [ "${HTTP_CODE}" != "200" ]; then
+          echo "WARNING: Failed to update PR comment (HTTP ${HTTP_CODE})"
+          cat /tmp/gh_patch_body || true
+        else
+          echo "Updated PR comment ${COMMENT_ID}"
+        fi
+
+    # ── Step 5: Fail job on non-success ───────────────────────────────────────
+    - name: Enforce Jenkins success
+      if: always() && steps.poll.outcome == 'success'
+      shell: bash
+      env:
+        BUILD_URL:    ${{ steps.resolve.outputs.build_url }}
+        BUILD_RESULT: ${{ steps.poll.outputs.build_result }}
+      run: |
+        set -euo pipefail
+        RESULT="${BUILD_RESULT:-}"
+        if [ "${RESULT}" = "SUCCESS" ]; then
+          echo "✅ Jenkins pipeline succeeded"
+          exit 0
+        fi
+        echo "❌ Jenkins pipeline did not succeed (result: ${RESULT:-unknown})"
+        echo "View the full build log at: ${BUILD_URL}console"
+        exit 1

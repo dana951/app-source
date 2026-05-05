@@ -1,0 +1,243 @@
+// Production deployment pipeline (GitHub Actions → Jenkins)
+// Jenkinsfile.prod — promoted image → GitOps (main) → staging smoke → human gate → prod smoke
+//
+// Triggered by GitHub Actions merge-to-main.yaml after Docker tag promotion.
+// Pure GitOps: only git push to gitops-manifests; Argo CD deploys. Jenkins uses kubectl
+// only to read Argo CD Application status (not to mutate the cluster).
+//
+// Single clone at ${WORKSPACE}/gitops-manifests - reused for prod after git pull.
+
+@Library('jenkins-shared-lib') _
+
+pipeline {
+
+    agent {
+        kubernetes {
+            label "podinfo-prod-${env.BUILD_NUMBER}"
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins-agent
+  containers:
+    - name: tools
+      image: alpine/k8s:1.35.4
+      command: [cat]
+      tty: true
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+    - name: python
+      image: python:3.11-slim
+      command: [cat]
+      tty: true
+      resources:
+        requests:
+          cpu: 200m
+          memory: 256Mi
+  nodeSelector:
+    workload/node-group: jenkins-agents
+"""
+        }
+    }
+
+    parameters {
+        string(name: 'IMAGE_TAG', description: 'Clean image tag (e.g. abc1234), no -dev suffix')
+        string(name: 'IMAGE_REPOSITORY', description: 'Docker image repository', defaultValue: 'devuser103/podinfo')
+        string(name: 'GIT_SHA', description: 'Git SHA for audit (short or full)')
+        string(name: 'GITHUB_ACTIONS_RUN_URL', defaultValue: '', description: 'GitHub Actions run that triggered this build')
+    }
+
+    environment {
+        GITOPS_REPO     = 'git@github.com:dana951/gitops-manifests.git'
+        GIT_CREDS_ID    = 'github-ssh-key-id'
+        GITOPS_DIR      = "${WORKSPACE}/gitops-manifests"
+
+        STAGING_NS      = 'staging'
+        PROD_NS         = 'prod'
+        STAGING_APP     = 'podinfo-staging'
+        PROD_APP        = 'podinfo-prod'
+        STAGING_URL     = 'http://podinfo.staging.svc.cluster.local'
+        PROD_URL        = 'http://podinfo.prod.svc.cluster.local'
+        STAGING_VALUES  = 'environments/podinfo/staging/values.yaml'
+        PROD_VALUES     = 'environments/podinfo/prod/values.yaml'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 25, unit: 'HOURS')
+        timestamps()
+        disableConcurrentBuilds()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        stage('Validate parameters') {
+            steps {
+                script {
+                    if (!params.IMAGE_TAG?.trim()) {
+                        error('IMAGE_TAG is required')
+                    }
+                    if (!params.IMAGE_REPOSITORY?.trim()) {
+                        error('IMAGE_REPOSITORY is required')
+                    }
+                    if (!params.GIT_SHA?.trim()) {
+                        error('GIT_SHA is required')
+                    }
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} | ${params.IMAGE_TAG}"
+                    currentBuild.description = "${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG} | ${params.GITHUB_ACTIONS_RUN_URL ?: 'n/a'}"
+                }
+            }
+        }
+
+        stage('Deploy to staging (GitOps)') {
+            steps {
+                withEnv([
+                    "DEPLOY_TAG=${params.IMAGE_TAG}",
+                    "DEPLOY_REPO=${params.IMAGE_REPOSITORY}",
+                ]) {
+                    container('tools') {
+                        sshagent(credentials: [env.GIT_CREDS_ID]) {
+                            dir('gitops-work-staging') {
+                                sh '''#!/bin/sh
+                                    set -eu
+                                    git clone --branch main "${GITOPS_REPO}" .
+                                    git config user.email "jenkins@ci.local"
+                                    git config user.name "Jenkins CI"
+                                    cat > "${STAGING_VALUES}" <<EOF
+image:
+  tag: ${DEPLOY_TAG}
+EOF
+                                    git add "${STAGING_VALUES}"
+                                    git commit -m "ci: deploy ${DEPLOY_TAG} to staging [skip ci]"
+                                    git push origin main
+                                    '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Wait for staging Healthy') {
+            steps {
+                container('tools') {
+                    script {
+                        WaitForArgoAppSync(
+                            appName: env.STAGING_APP,
+                            namespace: 'argocd',
+                            expectedImageTag: params.IMAGE_TAG,
+                            timeoutSeconds: 300,
+                            pollSeconds: 10
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Smoke tests (staging)') {
+            steps {
+                container('python') {
+                    script {
+                        runTests(
+                            environment:     'staging',
+                            appUrl:            env.STAGING_URL,
+                            expectedVersion:   params.IMAGE_TAG,
+                            markers:           'smoke'
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Approval: deploy to prod') {
+            steps {
+                timeout(time: 24, unit: 'HOURS') {
+                    input(
+                        message: """Deploy to PROD?
+
+Image:     ${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}
+Git SHA:   ${params.GIT_SHA}
+Staging:   ${env.STAGING_URL}
+GHA Run:   ${params.GITHUB_ACTIONS_RUN_URL}
+
+Approve to proceed with production deployment.""",
+                        ok: 'Deploy to prod'
+                    )
+                }
+            }
+        }
+
+        stage('Deploy to prod (GitOps)') {
+            steps {
+                withEnv([
+                    "DEPLOY_TAG=${params.IMAGE_TAG}",
+                    "DEPLOY_REPO=${params.IMAGE_REPOSITORY}",
+                ]) {
+                    container('tools') {
+                        sshagent(credentials: [env.GIT_CREDS_ID]) {
+                            dir('gitops-work-prod') {
+                                sh '''#!/bin/sh
+                                    set -eu
+                                    git clone --branch main "${GITOPS_REPO}" .
+                                    cat > "${PROD_VALUES}" <<EOF
+image:
+  tag: ${DEPLOY_TAG}
+EOF
+                                    git add "${PROD_VALUES}"
+                                    git commit -m "ci: deploy ${DEPLOY_TAG} to prod [skip ci]"
+                                    git push origin main
+                                    '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Wait for prod Healthy') {
+            steps {
+                container('tools') {
+                    script {
+                        WaitForArgoAppSync(
+                            appName: env.PROD_APP,
+                            namespace: 'argocd',
+                            expectedImageTag: params.IMAGE_TAG,
+                            timeoutSeconds: 300,
+                            pollSeconds: 10
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Smoke tests (prod)') {
+            steps {
+                container('python') {
+                    script {
+                        runTests(
+                            environment:     'prod',
+                            appUrl:            env.PROD_URL,
+                            expectedVersion:   params.IMAGE_TAG,
+                            markers:           'smoke'
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployment pipeline complete. ${params.IMAGE_TAG} is live in prod."
+        }
+        aborted {
+            echo "Pipeline aborted. Prod deployment did not proceed. Staging remains at ${params.IMAGE_TAG}."
+        }
+        failure {
+            echo "Pipeline failed at stage ${env.STAGE_NAME ?: 'unknown'}. Check ArgoCD and logs."
+        }
+    }
+}

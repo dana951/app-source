@@ -1,0 +1,133 @@
+# merge-to-main.yaml
+#
+# On push to main: promote the PR-built image (no rebuild).
+# Expects a merge commit: HEAD^2 is the feature-branch tip that was built as {short-sha}-dev
+# during PR validation. Retag to {short-sha} and latest, then trigger Jenkins (staging → gate → prod).
+
+name: podinfo merge to main — promote & deploy
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_IMAGE: "devuser103/podinfo"
+
+jobs:
+
+  promote-image:
+    name: "Promote Docker image (pull / retag / push)"
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+      dev_tag: ${{ steps.sha.outputs.dev_tag }}
+      clean_tag: ${{ steps.sha.outputs.clean_tag }}
+      image_uri_clean: ${{ steps.sha.outputs.image_uri_clean }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out merge commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve feature tip SHA (merge commit second parent)
+        id: sha
+        run: |
+          set -euo pipefail
+          if ! git rev-parse HEAD^2 >/dev/null 2>&1; then
+            echo "ERROR: HEAD^2 not found - this run is not a merge commit on main."
+            echo "Configure branch protection on main: allow merge commits only; disable squash and rebase merging."
+            exit 1
+          fi
+          MERGE_SHA=$(git rev-parse HEAD^2)
+          SHORT_SHA=$(echo "${MERGE_SHA}" | cut -c1-7)
+          echo "Feature tip (HEAD^2): ${MERGE_SHA}"
+          echo "short_sha=${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "dev_tag=${SHORT_SHA}-dev" >> "${GITHUB_OUTPUT}"
+          echo "clean_tag=${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "image_uri_clean=${DOCKERHUB_IMAGE}:${SHORT_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Verify source image exists in Docker Hub
+        env:
+          DEV_TAG: ${{ steps.sha.outputs.dev_tag }}
+        run: |
+          set -euo pipefail
+          echo "Verifying source image exists: ${DOCKERHUB_IMAGE}:${DEV_TAG}"
+          docker manifest inspect "${DOCKERHUB_IMAGE}:${DEV_TAG}" || {
+            echo "ERROR: Image ${DOCKERHUB_IMAGE}:${DEV_TAG} not found in Docker Hub."
+            echo "This usually means the PR validation workflow did not complete successfully."
+            exit 1
+          }
+
+      - name: Promote tags (no rebuild)
+        env:
+          DEV_TAG: ${{ steps.sha.outputs.dev_tag }}
+          CLEAN_TAG: ${{ steps.sha.outputs.clean_tag }}
+        run: |
+          set -euo pipefail
+          docker pull "${DOCKERHUB_IMAGE}:${DEV_TAG}"
+          docker tag "${DOCKERHUB_IMAGE}:${DEV_TAG}" "${DOCKERHUB_IMAGE}:${CLEAN_TAG}"
+          docker tag "${DOCKERHUB_IMAGE}:${DEV_TAG}" "${DOCKERHUB_IMAGE}:latest"
+          docker push "${DOCKERHUB_IMAGE}:${CLEAN_TAG}"
+          docker push "${DOCKERHUB_IMAGE}:latest"
+
+      - name: Summary
+        env:
+          DEV_TAG: ${{ steps.sha.outputs.dev_tag }}
+          CLEAN_TAG: ${{ steps.sha.outputs.clean_tag }}
+          SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
+          IMAGE_URI_CLEAN: ${{ steps.sha.outputs.image_uri_clean }}
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" << EOF
+          ## Image promotion (no rebuild)
+
+          | Field | Value |
+          |---|---|
+          | Docker Hub repository | \`${DOCKERHUB_IMAGE}\` |
+          | Source tag (PR build) | \`${DEV_TAG}\` |
+          | Promoted tags | \`${CLEAN_TAG}\`, \`latest\` |
+          | Feature tip short SHA | \`${SHORT_SHA}\` |
+          | Promoted URI | \`${IMAGE_URI_CLEAN}\` |
+          EOF
+
+  jenkins-deploy:
+    name: "Trigger Jenkins (staging → prod)"
+    runs-on: eks-gh-runner
+    needs: [promote-image]
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+
+      - name: Trigger Jenkins and wait for result
+        uses: ./.github/actions/jenkins-trigger
+        with:
+          jenkins-url: ${{ secrets.JENKINS_URL }}
+          jenkins-user: ${{ secrets.JENKINS_USER }}
+          jenkins-token: ${{ secrets.JENKINS_API_TOKEN }}
+          job-name: podinfo-prod-deploy
+          job-parameters: |
+            IMAGE_TAG=${{ needs.promote-image.outputs.clean_tag }}
+            IMAGE_REPOSITORY=${{ env.DOCKERHUB_IMAGE }}
+            GIT_SHA=${{ needs.promote-image.outputs.short_sha }}
+            GITHUB_ACTIONS_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          timeout-seconds: "3600"
+          poll-interval-seconds: "30"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
