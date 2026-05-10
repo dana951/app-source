@@ -250,21 +250,21 @@ spec:
             cleanWs()
         }
 
-        success {                                                                             // ← ADD
+        success {                                                                             
             notifyUtils(
                 message: "✅ PR-${params.PR_NUMBER} | *${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}* passed smoke + E2E tests — ready to merge.\nPR: ${params.GITHUB_PR_URL ?: 'n/a'}\nBuild: ${env.BUILD_URL}",
                 color: 'good'
             )
         }
 
-        failure {                                                                             // ← ADD
+        failure {                                                                             
             notifyUtils(
                 message: "❌ PR-${params.PR_NUMBER} | *${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}* failed validation.\nPR: ${params.GITHUB_PR_URL ?: 'n/a'}\nBuild: ${env.BUILD_URL}",
                 color: 'danger'
             )
         }
 
-        aborted {                                                                             // ← ADD
+        aborted {                                                                             
             notifyUtils(
                 message: "⚠️ PR-${params.PR_NUMBER} | *${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}* validation aborted.\nPR: ${params.GITHUB_PR_URL ?: 'n/a'}\nBuild: ${env.BUILD_URL}",
                 color: 'warning'
