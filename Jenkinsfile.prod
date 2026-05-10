@@ -1,11 +1,9 @@
 // Production deployment pipeline (GitHub Actions → Jenkins)
-// Jenkinsfile.prod — promoted image → GitOps (main) → staging smoke → human gate → prod smoke
+// Jenkinsfile.prod — promoted image → GitOps (staging) → staging smoke → human gate → prod smoke → GitOps (prod) → prod smoke
 //
 // Triggered by GitHub Actions merge-to-main.yaml after Docker tag promotion.
-// Pure GitOps: only git push to gitops-manifests; Argo CD deploys. Jenkins uses kubectl
-// only to read Argo CD Application status (not to mutate the cluster).
-//
-// Single clone at ${WORKSPACE}/gitops-manifests - reused for prod after git pull.
+// Pure GitOps: only git push to gitops-manifests 'main' branch (staging/prod environments); Argo CD deploys. 
+// Jenkins uses the Argo CD CLI (sync/wait) plus kubectl to verify the k8s Deployment image tag.
 
 @Library('jenkins-shared-lib') _
 
@@ -13,29 +11,24 @@ pipeline {
 
     agent {
         kubernetes {
-            label "podinfo-prod-${env.BUILD_NUMBER}"
+            label "podinfo-staging-prod-${env.BUILD_NUMBER}"
             yaml """
 apiVersion: v1
 kind: Pod
 spec:
   serviceAccountName: jenkins-agent
   containers:
+
     - name: tools
-      image: alpine/k8s:1.35.4
+      image: devuser103/devtools:1.0.0
       command: [cat]
       tty: true
-      resources:
-        requests:
-          cpu: 200m
-          memory: 256Mi
+
     - name: python
       image: python:3.11-slim
       command: [cat]
       tty: true
-      resources:
-        requests:
-          cpu: 200m
-          memory: 256Mi
+
   nodeSelector:
     workload/node-group: jenkins-agents
 """
@@ -50,10 +43,8 @@ spec:
     }
 
     environment {
-        GITOPS_REPO     = 'git@github.com:dana951/gitops-manifests.git'
-        GIT_CREDS_ID    = 'github-ssh-key-id'
-        GITOPS_DIR      = "${WORKSPACE}/gitops-manifests"
-
+        GITOPS_REPO     = 'https://github.com/dana951/gitops-manifests.git'
+        GIT_CREDS_ID    = 'gitops-manifests-github-app'
         STAGING_NS      = 'staging'
         PROD_NS         = 'prod'
         STAGING_APP     = 'podinfo-staging'
@@ -62,14 +53,23 @@ spec:
         PROD_URL        = 'http://podinfo.prod.svc.cluster.local'
         STAGING_VALUES  = 'environments/podinfo/staging/values.yaml'
         PROD_VALUES     = 'environments/podinfo/prod/values.yaml'
+        ARGOCD_SERVER        = 'argocd-server.argocd.svc.cluster.local'
+        ARGOCD_MAIN_APP_NAME = 'main-app'
+        K8S_DEPLOYMENT_NAME  = 'podinfo'
+        STAGING_DEPLOYED = 'false'
+        PROD_DEPLOYED    = 'false'
+        STAGING_PREVIOUS_TAG = ''
+        PROD_PREVIOUS_TAG    = ''
+        PROD_APPROVAL_ABORTED = 'false'
+        ARGOCD_CREDENTIAL_ID = 'argocd-token'
     }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '30'))
-        timeout(time: 25, unit: 'HOURS')
-        timestamps()
+        timeout(time: 24, unit: 'HOURS')
         disableConcurrentBuilds()
-        ansiColor('xterm')
+        // timestamps() # ToDo - install Timestamper Plugin
+        //ansiColor('xterm') # ToDo - install AnsiColor Plugin
     }
 
     stages {
@@ -79,9 +79,6 @@ spec:
                 script {
                     if (!params.IMAGE_TAG?.trim()) {
                         error('IMAGE_TAG is required')
-                    }
-                    if (!params.IMAGE_REPOSITORY?.trim()) {
-                        error('IMAGE_REPOSITORY is required')
                     }
                     if (!params.GIT_SHA?.trim()) {
                         error('GIT_SHA is required')
@@ -94,26 +91,52 @@ spec:
 
         stage('Deploy to staging (GitOps)') {
             steps {
-                withEnv([
-                    "DEPLOY_TAG=${params.IMAGE_TAG}",
-                    "DEPLOY_REPO=${params.IMAGE_REPOSITORY}",
-                ]) {
-                    container('tools') {
-                        sshagent(credentials: [env.GIT_CREDS_ID]) {
+                container('tools') {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: env.GIT_CREDS_ID,
+                            usernameVariable: 'GH_USER',
+                            passwordVariable: 'GH_TOKEN'
+                        )
+                    ]) {
+                        script {
+                            def repoPath = env.GITOPS_REPO.replace('https://', '')
+                            def repoUrl = "https://${env.GH_USER}:${env.GH_TOKEN}@${repoPath}"
+                            def valuesYaml = """
+                                image:
+                                  tag: ${params.IMAGE_TAG}
+                            """.stripIndent().trim() + '\n'
+
                             dir('gitops-work-staging') {
-                                sh '''#!/bin/sh
+                                sh """
                                     set -eu
-                                    git clone --branch main "${GITOPS_REPO}" .
+                                    git clone --depth 1 --branch main "${repoUrl}" .
+                                    git remote set-url origin "${repoUrl}"
                                     git config user.email "jenkins@ci.local"
                                     git config user.name "Jenkins CI"
-                                    cat > "${STAGING_VALUES}" <<EOF
-image:
-  tag: ${DEPLOY_TAG}
-EOF
-                                    git add "${STAGING_VALUES}"
-                                    git commit -m "ci: deploy ${DEPLOY_TAG} to staging [skip ci]"
+                                """
+
+                                // capture previous tag before overwriting (for rollback)
+                                def previousTag = sh(
+                                    script: "yq e '.image.tag' ${env.STAGING_VALUES}",
+                                    returnStdout: true
+                                ).trim()
+                                
+                                if (!previousTag || previousTag == 'null') {
+                                error("Deploy to staging (GitOps): could not read previous image tag from ${env.STAGING_VALUES} — got '${previousTag}'")
+                                }
+
+                                env.STAGING_PREVIOUS_TAG = previousTag
+                                echo "staging previous tag captured: ${previousTag}"
+
+                                writeFile(file: env.STAGING_VALUES, text: valuesYaml)
+                                sh """
+                                    set -eu
+                                    git add "${env.STAGING_VALUES}"
+                                    git commit -m "ci(jenkins-${env.BUILD_NUMBER}): deploy ${params.IMAGE_TAG} to staging [skip ci]"
                                     git push origin main
-                                    '''
+                                """
+                                env.STAGING_DEPLOYED = 'true'
                             }
                         }
                     }
@@ -124,15 +147,17 @@ EOF
         stage('Wait for staging Healthy') {
             steps {
                 container('tools') {
-                    script {
-                        WaitForArgoAppSync(
-                            appName: env.STAGING_APP,
-                            namespace: 'argocd',
-                            expectedImageTag: params.IMAGE_TAG,
-                            timeoutSeconds: 300,
-                            pollSeconds: 10
-                        )
-                    }
+                    waitForArgoCDSync(
+                        parentAppName: env.ARGOCD_MAIN_APP_NAME,
+                        appName: env.STAGING_APP,
+                        argocdServer: env.ARGOCD_SERVER,
+                        credentialsId: env.ARGOCD_CREDENTIAL_ID
+                    )
+                    verifyK8sDeploymentImageTag(
+                        deploymentName: env.K8S_DEPLOYMENT_NAME,
+                        namespace: env.STAGING_NS,
+                        expectedImage: "${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}"
+                    )
                 }
             }
         }
@@ -140,23 +165,23 @@ EOF
         stage('Smoke tests (staging)') {
             steps {
                 container('python') {
-                    script {
-                        runTests(
-                            environment:     'staging',
-                            appUrl:            env.STAGING_URL,
-                            expectedVersion:   params.IMAGE_TAG,
-                            markers:           'smoke'
-                        )
-                    }
+                    runTests(
+                        environment:     'staging',
+                        appUrl:            env.STAGING_URL,
+                        expectedVersion:   params.IMAGE_TAG,
+                        markers:           'smoke'
+                    )
                 }
             }
         }
 
         stage('Approval: deploy to prod') {
             steps {
-                timeout(time: 24, unit: 'HOURS') {
-                    input(
-                        message: """Deploy to PROD?
+                script {
+                    try {
+                        timeout(time: 24, unit: 'HOURS') {
+                            input(
+                                message: """Deploy to PROD?
 
 Image:     ${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}
 Git SHA:   ${params.GIT_SHA}
@@ -164,32 +189,65 @@ Staging:   ${env.STAGING_URL}
 GHA Run:   ${params.GITHUB_ACTIONS_RUN_URL}
 
 Approve to proceed with production deployment.""",
-                        ok: 'Deploy to prod'
-                    )
+                                ok: 'Deploy to prod'
+                            )
+                        }
+                    } catch (err) {
+                        env.PROD_APPROVAL_ABORTED = 'true'
+                        throw err
+                    }
                 }
             }
         }
 
         stage('Deploy to prod (GitOps)') {
             steps {
-                withEnv([
-                    "DEPLOY_TAG=${params.IMAGE_TAG}",
-                    "DEPLOY_REPO=${params.IMAGE_REPOSITORY}",
-                ]) {
-                    container('tools') {
-                        sshagent(credentials: [env.GIT_CREDS_ID]) {
+                container('tools') {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: env.GIT_CREDS_ID,
+                            usernameVariable: 'GH_USER',
+                            passwordVariable: 'GH_TOKEN'
+                        )
+                    ]) {
+                        script {
+                            def repoPath = env.GITOPS_REPO.replace('https://', '')
+                            def repoUrl = "https://${env.GH_USER}:${env.GH_TOKEN}@${repoPath}"
+                            def valuesYaml = """
+                                image:
+                                  tag: ${params.IMAGE_TAG}
+                            """.stripIndent().trim() + '\n'
+
                             dir('gitops-work-prod') {
-                                sh '''#!/bin/sh
+                                sh """
                                     set -eu
-                                    git clone --branch main "${GITOPS_REPO}" .
-                                    cat > "${PROD_VALUES}" <<EOF
-image:
-  tag: ${DEPLOY_TAG}
-EOF
-                                    git add "${PROD_VALUES}"
-                                    git commit -m "ci: deploy ${DEPLOY_TAG} to prod [skip ci]"
+                                    git clone --depth 1 --branch main "${repoUrl}" .
+                                    git remote set-url origin "${repoUrl}"
+                                    git config user.email "jenkins@ci.local"
+                                    git config user.name "Jenkins CI"
+                                """
+
+                                // capture previous tag before overwriting (for rollback)
+                                def previousTag = sh(
+                                    script: "yq e '.image.tag' ${env.PROD_VALUES}",
+                                    returnStdout: true
+                                ).trim()
+
+                                if (!previousTag || previousTag == 'null') {
+                                    error("Deploy to prod (GitOps): could not read previous image tag from ${env.PROD_VALUES} — got '${previousTag}'")
+                                }
+
+                                env.PROD_PREVIOUS_TAG = previousTag
+                                echo "prod previous tag captured: ${previousTag}"
+                                
+                                writeFile(file: env.PROD_VALUES, text: valuesYaml)
+                                sh """
+                                    set -eu
+                                    git add "${env.PROD_VALUES}"
+                                    git commit -m "ci(jenkins-${env.BUILD_NUMBER}): deploy ${params.IMAGE_TAG} to prod [skip ci]"
                                     git push origin main
-                                    '''
+                                """
+                                env.PROD_DEPLOYED = 'true'
                             }
                         }
                     }
@@ -200,15 +258,17 @@ EOF
         stage('Wait for prod Healthy') {
             steps {
                 container('tools') {
-                    script {
-                        WaitForArgoAppSync(
-                            appName: env.PROD_APP,
-                            namespace: 'argocd',
-                            expectedImageTag: params.IMAGE_TAG,
-                            timeoutSeconds: 300,
-                            pollSeconds: 10
-                        )
-                    }
+                    waitForArgoCDSync(
+                        parentAppName: env.ARGOCD_MAIN_APP_NAME,
+                        appName: env.PROD_APP,
+                        argocdServer: env.ARGOCD_SERVER,
+                        credentialsId: env.ARGOCD_CREDENTIAL_ID
+                    )
+                    verifyK8sDeploymentImageTag(
+                        deploymentName: env.K8S_DEPLOYMENT_NAME,
+                        namespace: env.PROD_NS,
+                        expectedImage: "${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}"
+                    )
                 }
             }
         }
@@ -216,14 +276,12 @@ EOF
         stage('Smoke tests (prod)') {
             steps {
                 container('python') {
-                    script {
-                        runTests(
-                            environment:     'prod',
-                            appUrl:            env.PROD_URL,
-                            expectedVersion:   params.IMAGE_TAG,
-                            markers:           'smoke'
-                        )
-                    }
+                    runTests(
+                        environment:     'prod',
+                        appUrl:            env.PROD_URL,
+                        expectedVersion:   params.IMAGE_TAG,
+                        markers:           'smoke'
+                    )
                 }
             }
         }
@@ -231,13 +289,116 @@ EOF
 
     post {
         success {
-            echo "Deployment pipeline complete. ${params.IMAGE_TAG} is live in prod."
+            echo "✅ Deployment pipeline complete. ${params.IMAGE_TAG} is live in prod."
+            notifyUtils(
+                message: "✅ *${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}* deployed to prod successfully.\nGit SHA: ${params.GIT_SHA}\nBuild: ${env.BUILD_URL}",
+                color: 'good'
+            )
         }
+
         aborted {
-            echo "Pipeline aborted. Prod deployment did not proceed. Staging remains at ${params.IMAGE_TAG}."
+            container('tools') {
+                script {
+                    if (env.PROD_APPROVAL_ABORTED == 'true') {
+                        // ── Cancelled at approval gate — staging healthy, prod untouched ──
+                        echo "⚠️ Prod deployment cancelled at approval gate."
+                        notifyUtils(
+                            message: "⚠️ Prod deployment cancelled at approval gate.\nStaging is at *${params.IMAGE_TAG}* and healthy - prod was NOT updated.\nBuild: ${env.BUILD_URL}",
+                            color: 'warning'
+                        )
+
+                    } else if (env.PROD_DEPLOYED == 'true') {
+                        // ── Aborted after prod git push — rollback prod ──────────────────
+                        echo "⚠️ Pipeline aborted after prod git push - rolling back prod."
+                        try {
+                            rollbackGitOps(
+                                environment:        'prod',
+                                valuesFile:         env.PROD_VALUES,
+                                previousTag:        env.PROD_PREVIOUS_TAG,
+                                gitopsRepo:         env.GITOPS_REPO,
+                                gitCredentialsId:   env.GIT_CREDS_ID,
+                                buildNumber:        env.BUILD_NUMBER,
+                                argocdApp:          env.PROD_APP,
+                                argocdMainApp:      env.ARGOCD_MAIN_APP_NAME,
+                                argocdServer:       env.ARGOCD_SERVER,
+                                argocdCredentialId: env.ARGOCD_CREDENTIAL_ID,
+                                deploymentName:     env.K8S_DEPLOYMENT_NAME,
+                                namespace:          env.PROD_NS,
+                                imageRepository:    params.IMAGE_REPOSITORY
+                            )
+                            notifyUtils(
+                                message: "⚠️ Pipeline aborted after prod git push — prod rolled back to *${env.PROD_PREVIOUS_TAG}* successfully.\nBuild: ${env.BUILD_URL}",
+                                color: 'warning'
+                            )
+                        } catch (rollbackErr) {
+                            notifyUtils(
+                                message: "🚨 Pipeline aborted and prod rollback failed — MANUAL INTERVENTION REQUIRED.\nProd may be running *${params.IMAGE_TAG}*.\nError: ${rollbackErr.message}\nBuild: ${env.BUILD_URL}",
+                                color: 'danger'
+                            )
+                        }
+
+                    } else {
+                        // ── Aborted before or during staging — next run will overwrite ───
+                        echo "⚠️ Pipeline aborted before prod deployment."
+                        notifyUtils(
+                            message: "⚠️ Pipeline aborted — prod was NOT updated.\nStaging may be mid-deploy at *${params.IMAGE_TAG}* but will be overwritten on next run.\nBuild: ${env.BUILD_URL}",
+                            color: 'warning'
+                        )
+                    }
+                }
+            }
         }
+
         failure {
-            echo "Pipeline failed at stage ${env.STAGE_NAME ?: 'unknown'}. Check ArgoCD and logs."
+            container('tools') {
+                script {
+                    echo "❌ Pipeline failed at stage ${env.STAGE_NAME ?: 'unknown'}."
+                    if (env.PROD_DEPLOYED == 'true') {
+                        // ── Failed after prod git push — rollback prod ───────────────────
+                        echo "❌ Failure after prod git push — rolling back prod."
+                        try {
+                            rollbackGitOps(
+                                environment:        'prod',
+                                valuesFile:         env.PROD_VALUES,
+                                previousTag:        env.PROD_PREVIOUS_TAG,
+                                gitopsRepo:         env.GITOPS_REPO,
+                                gitCredentialsId:   env.GIT_CREDS_ID,
+                                buildNumber:        env.BUILD_NUMBER,
+                                argocdApp:          env.PROD_APP,
+                                argocdMainApp:      env.ARGOCD_MAIN_APP_NAME,
+                                argocdServer:       env.ARGOCD_SERVER,
+                                argocdCredentialId: env.ARGOCD_CREDENTIAL_ID,
+                                deploymentName:     env.K8S_DEPLOYMENT_NAME,
+                                namespace:          env.PROD_NS,
+                                imageRepository:    params.IMAGE_REPOSITORY
+                            )
+                            notifyUtils(
+                                message: "⚠️ *${params.IMAGE_TAG}* failed in prod — rolled back to *${env.PROD_PREVIOUS_TAG}* successfully.\nBuild: ${env.BUILD_URL}",
+                                color: 'warning'
+                            )
+                        } catch (rollbackErr) {
+                            notifyUtils(
+                                message: "🚨 *${params.IMAGE_TAG}* failed in prod AND rollback failed — MANUAL INTERVENTION REQUIRED.\nProd may be running a broken image.\nError: ${rollbackErr.message}\nBuild: ${env.BUILD_URL}",
+                                color: 'danger'
+                            )
+                            throw rollbackErr
+                        }
+
+                    } else {
+                        // ── Failed before or during staging — prod untouched ─────────────
+                        // Staging is left as-is for debugging; next run overwrites it
+                        echo "❌ Pipeline failed before prod deployment — no rollback needed."
+                        notifyUtils(
+                            message: "❌ *${params.IMAGE_TAG}* failed in staging — staging left at *${params.IMAGE_TAG}* for debugging.\nProd was NOT updated.\nBuild: ${env.BUILD_URL}",
+                            color: 'danger'
+                        )
+                    }
+                }
+            }
+        }
+
+        always {
+            cleanWs()
         }
     }
 }

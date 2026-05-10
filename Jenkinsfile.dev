@@ -1,5 +1,5 @@
 // PR validation pipeline (GitHub Actions → Jenkins)
-// Ephemeral namespace per PR commit via GitOps branch + ApplicationSet; tests; branch delete cascades cleanup.
+// Ephemeral testing environment per PR via GitOps side branch + ApplicationSet; tests; PR close and branch delete cleanup.
 //
 // Parameters are passed from .github/workflows/podinfo-pr-validation.yaml (buildWithParameters).
 
@@ -9,7 +9,7 @@ pipeline {
 
     agent {
         kubernetes {
-            label "podinfo-pr-validation-${env.BUILD_NUMBER}"
+            label "pr-validation-${env.BUILD_NUMBER}"
             yaml """
 apiVersion: v1
 kind: Pod
@@ -18,22 +18,15 @@ spec:
   containers:
 
     - name: tools
-      image: alpine/k8s:1.35.4
+      image: devuser103/devtools:1.0.0
       command: [cat]
       tty: true
-      resources:
-        requests:
-          cpu: 200m
-          memory: 256Mi
 
     - name: python
       image: python:3.11-slim
       command: [cat]
       tty: true
-      resources:
-        requests:
-          cpu: 200m
-          memory: 256Mi
+
   nodeSelector:
     workload/node-group: jenkins-agents
 """
@@ -50,20 +43,23 @@ spec:
     }
 
     environment {
-        GITOPS_REPO            = 'git@github.com:dana951/gitops-manifests.git'
-        GIT_CREDS_ID           = 'github-ssh-key-id'
-        GITOPS_BRANCH          = "podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
-        NAMESPACE              = "podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
-        ARGOCD_APP_NAME        = "podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
-        APP_SVC_URL            = "http://podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}.podinfo-pr-${params.PR_NUMBER}-${params.SHORT_SHA}.svc.cluster.local"
+        GITOPS_REPO            = 'https://github.com/dana951/gitops-manifests.git'
+        GIT_CREDS_ID           = 'gitops-manifests-github-app'
+        GITOPS_BRANCH          = "pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
+        NAMESPACE              = "pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
+        ARGOCD_APP_NAME        = "pr-${params.PR_NUMBER}-${params.SHORT_SHA}"
+        ARGOCD_MAIN_APP_NAME   = 'main-app'
+        APP_SVC_URL            = "http://pr-${params.PR_NUMBER}-${params.SHORT_SHA}.pr-${params.PR_NUMBER}-${params.SHORT_SHA}.svc.cluster.local"
         GITOPS_BRANCH_CREATED  = 'false'
+        GITOPS_PR_NUMBER        = ''
+        ARGOCD_SERVER          = 'argocd-server.argocd.svc.cluster.local'
     }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '30'))
         timeout(time: 45, unit: 'MINUTES')
-        timestamps()
-        ansiColor('xterm')
+        // timestamps() # ToDo - install Timestamper Plugin
+        //ansiColor('xterm') # ToDo - install AnsiColor Plugin
     }
 
     stages {
@@ -79,9 +75,6 @@ spec:
                     }
                     if (!params.PR_NUMBER?.trim()) {
                         error('PR_NUMBER is required')
-                    }
-                    if (!params.IMAGE_REPOSITORY?.trim()) {
-                        error('IMAGE_REPOSITORY is required')
                     }
 
                     currentBuild.displayName = "#${env.BUILD_NUMBER} | PR-${params.PR_NUMBER} | ${params.SHORT_SHA}"
@@ -111,31 +104,50 @@ spec:
                 }
             }
         }
-        stage('Push GitOps branch') {
+        stage('Create and push GitOps branch') {
             steps {
                 container('tools') {
-                    sshagent([credentials: [env.GIT_CREDS_ID]]) { 
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: env.GIT_CREDS_ID,
+                            usernameVariable: 'GH_USER',
+                            passwordVariable: 'GH_TOKEN'
+                        )
+                    ]) {
                         script {
+                            def repoPath = env.GITOPS_REPO.replace('https://', '')
+                            def repoUrl = "https://${env.GH_USER}:${env.GH_TOKEN}@${repoPath}"
+                            def envDir = "environments/podinfo/${env.GITOPS_BRANCH}"
+                            def valuesYaml = """
+                                env:
+                                  APP_ENV: "qa"
+                                image:
+                                  tag: ${params.IMAGE_TAG}
+                                ephemeral:
+                                  enabled: true
+                                  namespace: "${env.NAMESPACE}"
+                            """.stripIndent().trim() + '\n'
+
                             dir('gitops-work') {
                                 sh """
                                     set -eu
-                                    git clone --depth 1 ${env.GITOPS_REPO} .
+                                    git clone --depth 1 "${repoUrl}" .
+                                    git remote set-url origin "${repoUrl}"
 
                                     git config user.email "jenkins@ci.local"
                                     git config user.name "Jenkins CI"
-                                    
                                     git checkout -B ${env.GITOPS_BRANCH}
-                                    
-                                    mkdir -p environments/podinfo/qa
-                                    cat > environments/podinfo/qa/values.yaml <<EOF
-env:
-    APP_ENV: "qa"
-image:
-    tag: ${params.IMAGE_TAG}
-EOF
-                                    git add environments/podinfo/qa/values.yaml
-                                    git commit -m "test(pr-validation): ephemeral PR env: \${GITOPS_BRANCH} image ${params.IMAGE_TAG}"
-                                    git push origin ${env.GITOPS_BRANCH} --force
+                                    mkdir -p "${envDir}"
+                                """
+                                writeFile(
+                                    file: "${envDir}/values.yaml",
+                                    text: valuesYaml
+                                )
+                                sh """
+                                    set -eu
+                                    git add "${envDir}/values.yaml"
+                                    git commit -m "ci(jenkins-${env.BUILD_NUMBER}): \"${env.GITOPS_BRANCH}\" [skip ci]"
+                                    git push origin ${env.GITOPS_BRANCH}
                                 """
                                 env.GITOPS_BRANCH_CREATED = 'true'
                             }
@@ -145,15 +157,36 @@ EOF
             }
         }
 
-        stage('Wait for ArgoCD Healthy') {
+        stage('Create PR GitOps branch to main') {
             steps {
                 container('tools') {
                     script {
-                        WaitForArgoAppSync(
+                        def prMessage = "ci(jenkins-${env.BUILD_NUMBER}): \"${env.GITOPS_BRANCH}\" [skip ci]"
+                        def gitopsPrNumber = createPullRequest(
+                            prMessage: prMessage,
+                            githubRepo: env.GITOPS_REPO,
+                            headBranch: env.GITOPS_BRANCH,
+                            baseBranch: 'main',
+                            credentialsId: env.GIT_CREDS_ID
+                        )
+                        if (gitopsPrNumber == null) {
+                            error('Stopping pipeline: GitOps PR was not opened or could not be resolved; PR is required.')
+                        }
+                        env.GITOPS_PR_NUMBER = gitopsPrNumber.toString()
+                    }
+                }
+            }
+        }
+
+        stage('Wait for GitOps Sync') {
+            steps {
+                container('tools') {
+                    script {
+                        waitForArgoCDSync(
+                            parentAppName: env.ARGOCD_MAIN_APP_NAME,
                             appName: env.ARGOCD_APP_NAME,
-                            namespace: 'argocd',
-                            timeoutSeconds: 300,
-                            pollSeconds: 10
+                            argocdServer: env.ARGOCD_SERVER,
+                            credentialsId: 'argocd-token'
                         )
                     }
                 }
@@ -163,14 +196,12 @@ EOF
         stage('Smoke tests') {
             steps {
                 container('python') {
-                    script {
-                        runTests(
-                            environment:     'qa',
-                            appUrl:            env.APP_SVC_URL,
-                            expectedVersion:   params.SHORT_SHA,
-                            markers:           'smoke'
-                        )
-                    }
+                    runTests(
+                        environment:     'qa',
+                        appUrl:            env.APP_SVC_URL,
+                        expectedVersion:   params.SHORT_SHA,
+                        markers:           'smoke'
+                    )
                 }
             }
         }
@@ -178,14 +209,12 @@ EOF
         stage('E2E tests') {
             steps {
                 container('python') {
-                    script {
-                        runTests(
-                            environment:     'qa',
-                            appUrl:            env.APP_SVC_URL,
-                            expectedVersion:   params.SHORT_SHA,
-                            markers:           'e2e'
-                        )
-                    }
+                    runTests(
+                        environment:     'qa',
+                        appUrl:            env.APP_SVC_URL,
+                        expectedVersion:   params.SHORT_SHA,
+                        markers:           'e2e'
+                    )
                 }
             }
         }
@@ -194,15 +223,22 @@ EOF
     post {
         always {
             script {
-                if (env.GITOPS_BRANCH_CREATED == 'true') {
-                    container('tools') {
-                        sh """
-                            set +e
-                            rm -rf gitops-cleanup
-                            git clone --depth 1 "\${GITOPS_REPO}" gitops-cleanup
-                            cd gitops-cleanup
-                            git push origin --delete "\${GITOPS_BRANCH}" || true
-                        """
+                container('tools') {
+                    script {
+                        if (env.GITOPS_PR_NUMBER?.trim()) {
+                            closePullRequest(
+                                prNumber: env.GITOPS_PR_NUMBER,
+                                githubRepo: env.GITOPS_REPO,
+                                credentialsId: env.GIT_CREDS_ID
+                            )
+                        }
+                        if (env.GITOPS_BRANCH_CREATED == 'true') {
+                            gitDeleteBranch(
+                                remoteUrl: env.GITOPS_REPO,
+                                branch: env.GITOPS_BRANCH,
+                                credentialsId: env.GIT_CREDS_ID
+                            )
+                        }
                     }
                 }
             }
