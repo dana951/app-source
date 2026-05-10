@@ -51,8 +51,9 @@ spec:
         ARGOCD_MAIN_APP_NAME   = 'main-app'
         APP_SVC_URL            = "http://pr-${params.PR_NUMBER}-${params.SHORT_SHA}.pr-${params.PR_NUMBER}-${params.SHORT_SHA}.svc.cluster.local"
         GITOPS_BRANCH_CREATED  = 'false'
-        GITOPS_PR_NUMBER        = ''
+        GITOPS_PR_NUMBER       = ''
         ARGOCD_SERVER          = 'argocd-server.argocd.svc.cluster.local'
+        K8S_DEPLOYMENT_NAME    = 'podinfo'
     }
 
     options {
@@ -187,6 +188,12 @@ spec:
                             appName: env.ARGOCD_APP_NAME,
                             argocdServer: env.ARGOCD_SERVER,
                             credentialsId: 'argocd-token'
+                        )
+
+                        verifyK8sDeploymentImageTag(
+                            deploymentName: env.K8S_DEPLOYMENT_NAME,
+                            namespace: env.NAMESPACE,
+                            expectedImage: "${params.IMAGE_REPOSITORY}:${params.IMAGE_TAG}"
                         )
                     }
                 }
