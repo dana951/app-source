@@ -194,6 +194,7 @@ jobs:
           repo: ${{ github.repository }}
 
       - name: Trigger Jenkins PR validation and wait
+        id: jenkins_pr_test
         env:
           GHA_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         uses: ./.github/actions/jenkins-trigger
@@ -215,3 +216,16 @@ jobs:
           repository: ${{ github.repository }}
           pull-request-number: ${{ github.event.pull_request.number }}
           github-actions-run-url: ${{ env.GHA_RUN_URL }}
+
+      - name: Post Jenkins Summary
+        if: always() # Runs even if Jenkins fails!
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Jenkins E2E Test Results
+
+          | Metric | Value |
+          |---|---|
+          | **Build Number** | #${{ steps.jenkins_pr_test.outputs.build-number }} |
+          | **Final Status** | ${{ steps.jenkins_pr_test.outputs.build-result }} |
+          | **Jenkins Link** | [View Build Log](${{ steps.jenkins_pr_test.outputs.build-url }}) |
+          EOF
